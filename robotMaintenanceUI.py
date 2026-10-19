@@ -19,7 +19,6 @@ import pyqtgraph as pg
 
 import robotInterface
 
-
 # =========================================================
 # Configuration
 # =========================================================
@@ -35,18 +34,27 @@ MAX_SAMPLES_PER_UPDATE = 500
 ROBOT_INDEX = 0
 JOINT_INDEX = 6
 
+SCOPE_WINDOW_POINTS = MAX_PLOT_POINTS
+
 
 class RobotMainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Robot TwinCAT Control & Monitor Interface")
-        self.resize(1000, 700)
+        self.resize(1100, 750)
 
         self._closing = False
         self._connecting = False
         self.scope_running = False
-        self.last_time = time.perf_counter()
+
+        self.time_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.value_data = deque(maxlen=MAX_PLOT_POINTS)
+        self.counter_x = 0
+
+        # 用户是否手动缩放或平移过视图
+        self._manual_view = False
 
         # =================================================
         # 1. Main layout
@@ -54,15 +62,17 @@ class RobotMainWindow(QMainWindow):
 
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
+
         main_layout = QVBoxLayout(central_widget)
 
         # =================================================
-        # 2. TwinCAT connection bar
+        # 2. ADS connection
         # =================================================
 
         top_layout = QHBoxLayout()
 
-        lbl_ams = QLabel("AMS Net ID:")
+        top_layout.addWidget(QLabel("AMS Net ID:"))
+
         self.input_ams = QLineEdit(DEFAULT_AMS_NET_ID)
         self.input_ams.setFixedWidth(180)
 
@@ -70,11 +80,11 @@ class RobotMainWindow(QMainWindow):
         self.btn_connect.clicked.connect(self.on_connect_clicked)
 
         self.lbl_status = QLabel("Disconnected")
+
         self.indicator_light = QLabel()
         self.indicator_light.setFixedSize(25, 25)
         self.set_indicator_status(False)
 
-        top_layout.addWidget(lbl_ams)
         top_layout.addWidget(self.input_ams)
         top_layout.addWidget(self.btn_connect)
         top_layout.addStretch()
@@ -85,31 +95,47 @@ class RobotMainWindow(QMainWindow):
         main_layout.addLayout(top_layout)
 
         # =================================================
-        # 3. Oscilloscope title and Start / Stop controls
+        # 3. Scope controls
         # =================================================
 
-        lbl_oscilloscope = QLabel(
-            f"<b>Real-time Oscilloscope "
-            f"(Robot {ROBOT_INDEX}, Joint {JOINT_INDEX})</b>"
+        main_layout.addWidget(
+            QLabel(
+                f"<b>Real-time Oscilloscope "
+                f"(Robot {ROBOT_INDEX}, "
+                f"Joint {JOINT_INDEX})</b>"
+            )
         )
-        main_layout.addWidget(lbl_oscilloscope)
 
-        scope_control_layout = QHBoxLayout()
+        scope_layout = QHBoxLayout()
 
         self.btn_start = QPushButton("Start")
         self.btn_stop = QPushButton("Stop")
+
+        self.btn_x_zoom_in = QPushButton("X Zoom +")
+        self.btn_x_zoom_out = QPushButton("X Zoom -")
+        self.btn_auto_range = QPushButton("Auto Range")
+
         self.btn_start.clicked.connect(self.start_scope)
         self.btn_stop.clicked.connect(self.stop_scope)
+
+        self.btn_x_zoom_in.clicked.connect(lambda: self.zoom_x(0.5))
+        self.btn_x_zoom_out.clicked.connect(lambda: self.zoom_x(2.0))
+        self.btn_auto_range.clicked.connect(self.auto_range)
+
         self.btn_stop.setEnabled(False)
 
         self.lbl_scope_status = QLabel("Scope stopped")
 
-        scope_control_layout.addWidget(self.btn_start)
-        scope_control_layout.addWidget(self.btn_stop)
-        scope_control_layout.addStretch()
-        scope_control_layout.addWidget(self.lbl_scope_status)
+        scope_layout.addWidget(self.btn_start)
+        scope_layout.addWidget(self.btn_stop)
+        scope_layout.addSpacing(15)
+        scope_layout.addWidget(self.btn_x_zoom_in)
+        scope_layout.addWidget(self.btn_x_zoom_out)
+        scope_layout.addWidget(self.btn_auto_range)
+        scope_layout.addStretch()
+        scope_layout.addWidget(self.lbl_scope_status)
 
-        main_layout.addLayout(scope_control_layout)
+        main_layout.addLayout(scope_layout)
 
         # =================================================
         # 4. Plot widget
@@ -117,30 +143,48 @@ class RobotMainWindow(QMainWindow):
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("w")
-        self.plot_widget.showGrid(x=True, y=True)
+
+        plot_item = self.plot_widget.getPlotItem()
+        self.view_box = plot_item.getViewBox()
+
+        self.plot_widget.showGrid(
+            x=True,
+            y=True,
+            alpha=0.3,
+        )
+
         self.plot_widget.setLabel("bottom", "Sample Index")
         self.plot_widget.setLabel("left", "Joint Position")
+
+        # 允许鼠标交互
         self.plot_widget.setMouseEnabled(x=True, y=True)
-        self.plot_widget.getPlotItem().setMenuEnabled(True)
 
-        self.plot_widget.enableAutoRange(axis="y", enable=True)
+        # 左键拖动矩形框选，松开后放大选区
+        self.view_box.setMouseMode(pg.ViewBox.RectMode)
 
-        # Circle symbols make individual samples clickable.
+        plot_item.setMenuEnabled(True)
+
+        self.plot_widget.getAxis("bottom").setStyle(tickTextOffset=8)
+
+        # 曲线及可点击的圆形数据点
         self.curve = self.plot_widget.plot(
-            pen=pg.mkPen(color="b", width=2),
+            [],
+            [],
+            pen=pg.mkPen(color="b", width=1.5),
             name="Joint Position",
             symbol="o",
-            symbolSize=5,
+            symbolSize=6,
             symbolBrush="b",
             symbolPen=pg.mkPen(color="b", width=1),
         )
-        self.curve.setClipToView(True)
-        self.curve.setDownsampling(auto=True, method="peak")
-        self.curve.sigPointsClicked.connect(self.on_points_clicked)
 
-        self.time_data = deque(maxlen=MAX_PLOT_POINTS)
-        self.value_data = deque(maxlen=MAX_PLOT_POINTS)
-        self.counter_x = 0
+        self.curve.setClipToView(True)
+        self.curve.setDownsampling(
+            auto=True,
+            method="peak",
+        )
+
+        self.curve.sigPointsClicked.connect(self.on_points_clicked)
 
         main_layout.addWidget(self.plot_widget)
 
@@ -153,7 +197,7 @@ class RobotMainWindow(QMainWindow):
         self.heartbeat_timer.timeout.connect(self.write_heartbeat)
 
         # =================================================
-        # 6. UI / data queue timer
+        # 6. UI timer
         # =================================================
 
         self.ui_timer = QTimer(self)
@@ -167,7 +211,7 @@ class RobotMainWindow(QMainWindow):
     # =====================================================
 
     def set_indicator_status(self, is_connected):
-        """Update the ADS connection label and indicator light."""
+
         if is_connected:
             self.indicator_light.setStyleSheet(
                 "background-color: #2ecc71;"
@@ -175,6 +219,7 @@ class RobotMainWindow(QMainWindow):
                 "border: 1px solid #27ae60;"
             )
             self.lbl_status.setText("Connected")
+
         else:
             self.indicator_light.setStyleSheet(
                 "background-color: #bdc3c7;"
@@ -188,7 +233,7 @@ class RobotMainWindow(QMainWindow):
     # =====================================================
 
     def on_connect_clicked(self):
-        """Establish the ADS connection when Connect is clicked."""
+
         if self._connecting:
             return
 
@@ -201,6 +246,7 @@ class RobotMainWindow(QMainWindow):
             return
 
         ams_id = self.input_ams.text().strip()
+
         if not ams_id:
             QMessageBox.warning(
                 self,
@@ -215,75 +261,239 @@ class RobotMainWindow(QMainWindow):
 
         try:
             success = robotInterface.connect(ams_id)
+
         except Exception as exc:
             success = False
             print(f"[UI] Connection exception: {exc}")
+
         finally:
             self._connecting = False
             self.btn_connect.setEnabled(True)
 
         if success:
             self.set_indicator_status(bool(robotInterface.m_robotConnected))
+
             self.heartbeat_timer.start()
+
             QMessageBox.information(
                 self,
                 "Success",
                 "Connected to TwinCAT successfully!",
             )
+
         else:
             self.set_indicator_status(False)
+
             QMessageBox.critical(
                 self,
                 "Error",
-                "Failed to connect to TwinCAT. "
-                "Check AMS Net ID and PLC status.",
+                "Failed to connect to TwinCAT. " "Check AMS Net ID and PLC status.",
             )
 
     # =====================================================
-    # Oscilloscope Start / Stop
+    # Data queue
+    # =====================================================
+
+    def get_data_queue(self):
+
+        data_queue = getattr(
+            robotInterface,
+            "m_robotStatusDataQueue",
+            None,
+        )
+
+        if data_queue is None:
+            data_queue = getattr(
+                robotInterface,
+                "m_robotStatusDataList",
+                None,
+            )
+
+        return data_queue
+
+    def clear_data_queue(self):
+        """
+        丢弃本次采集开始前积压的状态数据。
+        """
+
+        data_queue = self.get_data_queue()
+
+        if data_queue is None:
+            return
+
+        while True:
+            try:
+                data_queue.get_nowait()
+
+            except queue.Empty:
+                break
+
+            except Exception as exc:
+                print(f"[UI] Queue clear failed: {exc}")
+                break
+
+    # =====================================================
+    # Scope Start / Stop
     # =====================================================
 
     def start_scope(self):
-        """Start plotting new data without clearing the existing curve."""
+        """
+        清空旧数据并启动新的 Scope 采集。
+        X 轴固定显示 10 秒对应的采样点范围。
+        """
+
+        self.clear_data_queue()
+
+        self.time_data.clear()
+        self.value_data.clear()
+        self.counter_x = 0
+
+        self.curve.setData([], [])
+
+        self._manual_view = False
+
+        # 关闭双轴自动缩放
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.XYAxes,
+            enable=False,
+        )
+
+        # 初始 X 轴固定为 0～10 秒对应的点数
+        self.view_box.setXRange(
+            0,
+            SCOPE_WINDOW_POINTS,
+            padding=0,
+        )
+
+        # 只允许 Y 轴自动适应数据
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.YAxis,
+            enable=True,
+        )
+
         self.scope_running = True
+
         self.lbl_scope_status.setText("Scope running")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
     def stop_scope(self):
-        """Stop updating the plot and keep the current curve visible."""
+        """
+        停止向曲线添加数据，保留现有曲线。
+        """
+
         self.scope_running = False
+
         self.lbl_scope_status.setText("Scope stopped")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
+    # =====================================================
+    # Click data point
+    # =====================================================
+
     def on_points_clicked(self, plot_item, points):
-        """Show the sample index and value when a curve point is clicked."""
+        """
+        点击圆形数据点后显示 X/Y 坐标。
+        """
+
         if not points:
             return
 
         point = points[0]
+
         x_value = point.pos().x()
         y_value = point.pos().y()
 
         QMessageBox.information(
             self,
-            "Sample Information",
-            f"Sample Index: {x_value:.0f}\n"
-            f"Joint Position: {y_value:.6f}",
+            "Point Data",
+            f"X: {x_value:.3f}\n" f"Y: {y_value:.6f}",
         )
+
+    # =====================================================
+    # X-axis zoom
+    # =====================================================
+
+    def zoom_x(self, factor):
+        """
+        factor < 1：横向放大
+        factor > 1：横向缩小
+        保持纵轴范围不变。
+        """
+
+        x_range, _ = self.view_box.viewRange()
+
+        x_min, x_max = x_range
+        center = (x_min + x_max) / 2.0
+        half_width = (x_max - x_min) * factor / 2.0
+
+        if half_width <= 0:
+            return
+
+        self._manual_view = True
+
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.XYAxes,
+            enable=False,
+        )
+
+        self.view_box.setXRange(
+            center - half_width,
+            center + half_width,
+            padding=0,
+        )
+
+    # =====================================================
+    # Auto Range
+    # =====================================================
+
+    def auto_range(self):
+        """
+        恢复实时窗口跟随模式：
+        X 轴显示最近 10 秒，Y 轴自动适应。
+        """
+
+        self._manual_view = False
+
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.XYAxes,
+            enable=False,
+        )
+
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.YAxis,
+            enable=True,
+        )
+
+        if self.counter_x <= SCOPE_WINDOW_POINTS:
+            self.view_box.setXRange(
+                0,
+                SCOPE_WINDOW_POINTS,
+                padding=0,
+            )
+        else:
+            self.view_box.setXRange(
+                self.counter_x - SCOPE_WINDOW_POINTS,
+                self.counter_x,
+                padding=0,
+            )
 
     # =====================================================
     # Heartbeat
     # =====================================================
 
     def write_heartbeat(self):
-        """Write heartbeat while connected, regardless of scope state."""
-        if self._closing or not robotInterface.m_robotConnected:
+
+        if self._closing:
+            return
+
+        if not robotInterface.m_robotConnected:
             return
 
         try:
             robotInterface.writeHeartBeat()
+
         except Exception as exc:
             print(f"[UI] Heartbeat write failed: {exc}")
 
@@ -292,28 +502,18 @@ class RobotMainWindow(QMainWindow):
     # =====================================================
 
     def update_ui_and_plot(self):
-        """Consume queued status data; update the curve only when Start is active."""
+
         if self._closing:
             return
 
         is_connected = bool(robotInterface.m_robotConnected)
+
         self.set_indicator_status(is_connected)
 
         if not is_connected:
             return
 
-        data_queue = getattr(
-            robotInterface,
-            "m_robotStatusDataQueue",
-            None,
-        )
-        if data_queue is None:
-            # Compatibility with an older variable name. It must also be queue.Queue.
-            data_queue = getattr(
-                robotInterface,
-                "m_robotStatusDataList",
-                None,
-            )
+        data_queue = self.get_data_queue()
 
         if data_queue is None:
             return
@@ -321,78 +521,128 @@ class RobotMainWindow(QMainWindow):
         updated = False
 
         for _ in range(MAX_SAMPLES_PER_UPDATE):
+
             try:
                 data_item = data_queue.get_nowait()
+
             except queue.Empty:
                 break
+
             except Exception as exc:
                 print(f"[UI] Queue read failed: {exc}")
                 break
 
-            # While stopped, consume the queue but leave the displayed curve unchanged.
+            # Stop 时仍然消费队列，避免旧数据积压
             if not self.scope_running:
                 continue
 
             try:
-                value = float(
-                    data_item.m_armJntPos[ROBOT_INDEX][JOINT_INDEX]
-                )
+                value = float(data_item.m_armJntPos[ROBOT_INDEX][JOINT_INDEX])
+
                 self.counter_x += 1
+
                 self.time_data.append(self.counter_x)
                 self.value_data.append(value)
+
                 updated = True
-            except (AttributeError, IndexError, TypeError, ValueError) as exc:
+
+            except (
+                AttributeError,
+                IndexError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 print(f"[UI] Invalid robot status data: {exc}")
 
-        if self.scope_running and updated:
-            self.curve.setData(
-                list(self.time_data),
-                list(self.value_data),
-            )
+        if not self.scope_running or not updated:
+            return
 
-        # Optional timing diagnostic; uncomment if needed.
-        # current_time = time.perf_counter()
-        # interval_ms = (current_time - self.last_time) * 1000.0
-        # print(f"[UI Interval] {interval_ms:.2f} ms")
-        # self.last_time = current_time
+        # 每次 UI 更新只刷新一次曲线
+        self.curve.setData(
+            list(self.time_data),
+            list(self.value_data),
+        )
+
+        # 纵轴自动适应数据，不自动缩放横轴
+        self.view_box.enableAutoRange(
+            axis=pg.ViewBox.YAxis,
+            enable=True,
+        )
+
+        # 用户手动缩放或平移时，不覆盖用户视图
+        if not self._manual_view:
+
+            if self.counter_x <= SCOPE_WINDOW_POINTS:
+                # 前 10 秒：固定窗口，避免横轴持续变化
+                self.view_box.setXRange(
+                    0,
+                    SCOPE_WINDOW_POINTS,
+                    padding=0,
+                )
+
+            else:
+                # 超过 10 秒：窗口随最新数据向右滚动
+                self.view_box.setXRange(
+                    self.counter_x - SCOPE_WINDOW_POINTS,
+                    self.counter_x,
+                    padding=0,
+                )
 
     # =====================================================
-    # Close window and release ADS resources
+    # Close window
     # =====================================================
 
     def closeEvent(self, event):
-        """Stop timers and attempt to release ADS resources."""
+
         self._closing = True
+
         self.ui_timer.stop()
         self.heartbeat_timer.stop()
 
-        disconnect_func = getattr(robotInterface, "disconnect", None)
+        disconnect_func = getattr(
+            robotInterface,
+            "disconnect",
+            None,
+        )
+
         if callable(disconnect_func):
+
             try:
                 result = disconnect_func()
+
                 if result is False:
                     self._closing = False
+
                     QMessageBox.warning(
                         self,
                         "Warning",
-                        "ADS resources have not been released successfully. "
-                        "Please try closing again.",
+                        "ADS resources have not been released "
+                        "successfully. Please try closing again.",
                     )
+
                     self.ui_timer.start(UI_INTERVAL_MS)
+
                     if robotInterface.m_robotConnected:
                         self.heartbeat_timer.start(HEARTBEAT_INTERVAL_MS)
+
                     event.ignore()
                     return
+
             except Exception as exc:
+
                 self._closing = False
+
                 QMessageBox.critical(
                     self,
                     "Error",
                     f"Failed to disconnect from TwinCAT:\n{exc}",
                 )
+
                 self.ui_timer.start(UI_INTERVAL_MS)
+
                 if robotInterface.m_robotConnected:
                     self.heartbeat_timer.start(HEARTBEAT_INTERVAL_MS)
+
                 event.ignore()
                 return
 
@@ -404,7 +654,10 @@ class RobotMainWindow(QMainWindow):
 # =========================================================
 
 if __name__ == "__main__":
+
     app = QApplication(sys.argv)
+
     window = RobotMainWindow()
     window.show()
+
     sys.exit(app.exec_())
