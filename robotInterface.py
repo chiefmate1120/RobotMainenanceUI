@@ -4,12 +4,9 @@ import pyads
 import queue
 
 
-# ==========================================
-# 1. 定义 TwinCAT 结构体对应的 Python ctypes 结构体
-# ==========================================
+# slave robot status
 class ST_RMRobotStatusData(ctypes.Structure):
     _fields_ = [
-        ("m_dataHeartBeat", ctypes.c_int32),
         ("m_cartJntPos", ctypes.c_double * 8),
         ("m_cartStatusWord", ctypes.c_int32 * 8),
         ("m_cartCmdWord", ctypes.c_int32 * 8),
@@ -28,6 +25,39 @@ class ST_RMRobotStatusData(ctypes.Structure):
     ]
 
 
+class ST_RMJntCtrlData(ctypes.Structure):
+    _fields_ = [
+        ("m_cartJntEnable", ctypes.c_bool * 8),
+        ("m_cartCmdJntPos", ctypes.c_double * 8),
+        ("m_armJntEnable", (ctypes.c_bool * 13) * 4),
+        ("m_armCmdOPMode", (ctypes.c_int16 * 13) * 4),
+        ("m_armCmdJntPos", (ctypes.c_double * 13) * 4),
+        ("m_armCmdMotorCurrent", (ctypes.c_int32 * 13) * 4),
+    ]
+
+
+# enable UI control, transit PLC state machine
+# set by UI
+m_UICtrlEnable = False
+
+# mode. set by UI
+# 1: joint control
+m_RMMode = 0
+ADSDataConfig = {
+    0: (
+        "GVL_RMInterfaceData.g_RMJntCtrlData",
+        ST_RMJntCtrlData,
+    ),
+    # 1: (
+    #     "GVL_RMInterfaceData.g_UICartCmdsData",
+    #     ST_RMCartCtrlData,
+    # ),
+    # 2: (
+    #     "GVL_RMInterfaceData.g_UIArmCmdsData",
+    #     ST_RMArmCtrlData,
+    # ),
+}
+
 # ==========================================
 # 2. 全局变量定义
 # ==========================================
@@ -37,12 +67,12 @@ m_UIHeartBeat = 0  # Python 端的心跳变量
 m_robotConnected = False
 m_robotConnectCounts = 0
 m_robotDataBufferSize = 100
+m_robotCmdsSeq = 1
+
+
 lastTime = time.perf_counter()
 
 
-# ==========================================
-# 3. 核心功能函数与带装饰器的回调
-# ==========================================
 def connect(ams_net_id):
     res = False
     """
@@ -51,7 +81,9 @@ def connect(ams_net_id):
     global plc, m_robotConnected, m_robotStatusDataQueue, lastTime
     try:
         ADS_PORT = 851
-        PLC_IP = "192.168.0.30"
+        # get ip
+        parts = ams_net_id.split(".")
+        PLC_IP = ".".join(parts[:4]) if len(parts) >= 4 else ams_net_id
 
         plc = pyads.Connection(ams_net_id, ADS_PORT, PLC_IP)
         plc.open()
@@ -108,12 +140,12 @@ def connect(ams_net_id):
 
         # 注册变量变化监听通知（直接绑定上面定义好的带有装饰器的函数）
         plc.add_device_notification(
-            "GVL_RMInterfaceData.g_robotStatusData", attr, readRobotData
+            "GVL_RMInterfaceData.g_slaveRobotStatusData", attr, readRobotData
         )
         print(
             "[Connect] Successfully registered notification for 'g_robotStatusData' with decorator."
         )
-
+        m_robotConnected = True
         res = True
 
     except Exception as e:
@@ -140,5 +172,91 @@ def writeHeartBeat():
         print("[Warning] PLC is not connected yet.")
 
     m_robotConnectCounts = min(20, (m_robotConnectCounts + 1))
-    if m_robotConnectCounts > 19:
+    if m_robotConnectCounts > 5:
         m_robotConnected = False
+
+
+def writeUIEnable(enableFlag):
+    global plc, m_UICtrlEnable
+
+    if plc is None or not plc.is_open:
+        print("[Warning] PLC is not connected yet.")
+        return False
+
+    try:
+        enable = bool(enableFlag)
+        plc.write_by_name(
+            "GVL_RMInterfaceData.g_UICtrlEnable",
+            enable,
+            pyads.PLCTYPE_BOOL,
+        )
+        m_UICtrlEnable = enable
+
+        return True
+    except Exception as e:
+        print(f"[Error] Failed to write UI enable: {e}")
+        return False
+
+
+def writeModuleIdx(module_idx):
+    """
+    将当前分页编号写入 PLC 变量 GVL_RMInterfaceData.g_UICtrlModule。
+    0=患者台车，1~4=1~4号臂。
+    """
+    global plc
+
+    if plc is None or not plc.is_open:
+        print("[Warning] PLC is not connected yet.")
+        return False
+
+    try:
+        plc.write_by_name(
+            "GVL_RMInterfaceData.g_UICtrlModule",
+            int(module_idx),
+            pyads.PLCTYPE_INT,
+        )
+        print(f"[UICtrlModule] Written g_UICtrlModule = {module_idx}")
+        return True
+    except Exception as e:
+        print(f"[Error] Failed to write UI control module index: {e}")
+        return False
+
+
+def writeUICmds(cmds, mode):
+    global plc, m_robotCmdsSeq, m_RMMode
+
+    if plc is None or not plc.is_open:
+        print("[Warning] PLC is not connected yet.")
+        return False
+
+    # mode check
+    config = ADSDataConfig.get(mode)
+    if config is None:
+        print(f"[Error] Invalid command mode: {mode}")
+        return False
+    plc_var_name, struct_type = config
+
+    try:
+        plc.write_by_name(
+            plc_var_name,
+            cmds,
+            struct_type,
+        )
+
+        plc.write_by_name(
+            "GVL_RMInterfaceData.g_RMMode",
+            m_RMMode,
+            pyads.PLCTYPE_INT,
+        )
+
+        m_robotCmdsSeq = (m_robotCmdsSeq + 1) % 10
+        plc.write_by_name(
+            "GVL_RMInterfaceData.g_UICmdsDataSeq",
+            m_robotCmdsSeq,
+            pyads.PLCTYPE_INT,
+        )
+        print("[UICmds] Written g_UICmdsData")
+        return True
+    except Exception as e:
+        print(f"[Error] Failed to write UI commands: {e}")
+        return False

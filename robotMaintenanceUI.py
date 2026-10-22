@@ -42,6 +42,8 @@ class RobotMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
+        self.slaveRobotData = robotInterface.ST_RMRobotStatusData()
+
         self.setWindowTitle("Robot TwinCAT Control & Monitor Interface")
         self.resize(1100, 750)
 
@@ -523,7 +525,7 @@ class RobotMainWindow(QMainWindow):
         for _ in range(MAX_SAMPLES_PER_UPDATE):
 
             try:
-                data_item = data_queue.get_nowait()
+                self.slaveRobotData = data_queue.get_nowait()
 
             except queue.Empty:
                 break
@@ -537,7 +539,7 @@ class RobotMainWindow(QMainWindow):
                 continue
 
             try:
-                value = float(data_item.m_armJntPos[ROBOT_INDEX][JOINT_INDEX])
+                value = float(self.slaveRobotData.m_armJntPos[ROBOT_INDEX][JOINT_INDEX])
 
                 self.counter_x += 1
 
